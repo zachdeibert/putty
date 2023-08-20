@@ -11,6 +11,9 @@
 #include "storage.h"
 #include "tree234.h"
 
+#include "SetupAPI.h"
+#pragma comment(lib, "setupapi.lib")
+
 #define PRINTER_DISABLED_STRING "None (printing disabled)"
 
 #define HOST_BOX_TITLE "Host Name (or IP address)"
@@ -181,6 +184,11 @@ void conf_fontsel_handler(dlgcontrol *ctrl, dlgparam *dlg,
     }
 }
 
+struct serialport {
+    char name[34];
+    char devname[16];
+};
+
 static void config_host_handler(dlgcontrol *ctrl, dlgparam *dlg,
                                 void *data, int event)
 {
@@ -192,23 +200,77 @@ static void config_host_handler(dlgcontrol *ctrl, dlgparam *dlg,
      * different places depending on the protocol.
      */
     if (event == EVENT_REFRESH) {
+        dlg_update_start(ctrl, dlg);
+        dlg_listbox_clear(ctrl, dlg);
         if (conf_get_int(conf, CONF_protocol) == PROT_SERIAL) {
             /*
              * This label text is carefully chosen to contain an n,
              * since that's the shortcut for the host name control.
              */
             dlg_label_change(ctrl, dlg, "Serial line");
-            dlg_editbox_set(ctrl, dlg, conf_get_str(conf, CONF_serline));
+            char *s = conf_get_str(conf, CONF_serline);
+            /*
+             * Iff the user hasn't changed the port from the default,
+             * set it to the first available serial port instead of
+             * defaulting to a port that might not exist.
+             */
+            char *d = platform_default_s("SerialLine");
+            if (!strcmp(s, d)) {
+                struct serialport *sp =
+                    (struct serialport *) ctrl->context.p;
+                if (*sp->name) {
+                    s = sp->name;
+                    /*
+                     * Also make sure to update the config so opening
+                     * the connection works if the default port is used.
+                     */
+                    conf_set_str(conf, CONF_serline, sp->devname);
+                }
+            }
+            sfree(d);
+            /*
+             * Add all available ports to the list, and update the edit
+             * box contents if the selected port has a friendly name.
+             */
+            for (struct serialport *sp = (struct serialport *)
+                ctrl->context.p; *sp->devname; ++sp) {
+                dlg_listbox_add(ctrl, dlg, sp->name);
+                if (!strcmp(s, sp->devname)) {
+                    s = sp->name;
+                }
+            }
+            dlg_editbox_set(ctrl, dlg, s);
         } else {
             dlg_label_change(ctrl, dlg, HOST_BOX_TITLE);
             dlg_editbox_set(ctrl, dlg, conf_get_str(conf, CONF_host));
+            /*
+             * Add an item and remove it again to make sure the prevent
+             * the dropdown from being really long and empty.
+             */
+            dlg_listbox_add(ctrl, dlg, "");
+            dlg_listbox_clear(ctrl, dlg);
         }
+        dlg_update_done(ctrl, dlg);
     } else if (event == EVENT_VALCHANGE) {
         char *s = dlg_editbox_get(ctrl, dlg);
-        if (conf_get_int(conf, CONF_protocol) == PROT_SERIAL)
-            conf_set_str(conf, CONF_serline, s);
-        else
+        if (conf_get_int(conf, CONF_protocol) == PROT_SERIAL) {
+            /*
+             * Save the device name in the config, not the friendly
+             * name.
+             */
+            char *d = s;
+            for (struct serialport *sp =
+                    (struct serialport *)ctrl->context.p;
+                *sp->devname; ++sp) {
+                if (!strcmp(s, sp->name)) {
+                    d = sp->devname;
+                    break;
+                }
+            }
+            conf_set_str(conf, CONF_serline, d);
+        } else {
             conf_set_str(conf, CONF_host, s);
+        }
         sfree(s);
     }
 }
@@ -1770,6 +1832,136 @@ static void host_ca_button_handler(dlgcontrol *ctrl, dlgparam *dp,
         show_ca_config_box(dp);
 }
 
+struct serialport_list {
+    struct serialport value;
+    int number;
+    struct serialport_list *next;
+};
+
+static struct serialport *list_serial_ports(struct controlbox *b) {
+    struct serialport_list *head = NULL;
+
+    /*
+     * Query the available serial ports from Device Manager.
+     */
+    LSTATUS err;
+    bool res;
+    HDEVINFO hDevInfo = SetupDiGetClassDevs(
+        &GUID_DEVINTERFACE_SERENUM_BUS_ENUMERATOR, NULL, NULL,
+        DIGCF_PRESENT);
+    assert(hDevInfo != INVALID_HANDLE_VALUE);
+    int count = 0;
+    char *buf = NULL;
+    size_t buf_len = 0;
+    while (true) {
+        SP_DEVINFO_DATA devInfo;
+        devInfo.cbSize = sizeof(devInfo);
+        if (!SetupDiEnumDeviceInfo(hDevInfo, count++, &devInfo)) {
+            assert(GetLastError() == ERROR_NO_MORE_ITEMS);
+            break;
+        }
+        HKEY key = SetupDiOpenDevRegKey(hDevInfo, &devInfo,
+            DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE);
+        assert(key != INVALID_HANDLE_VALUE);
+        struct serialport port;
+        DWORD len = sizeof(port.devname);
+        err = RegGetValue(key, NULL, "PortName", RRF_RT_REG_SZ, NULL,
+            &port.devname, &len);
+        assert(err == ERROR_SUCCESS);
+        err = RegCloseKey(key);
+        assert(err == ERROR_SUCCESS);
+        while (true) {
+            res = SetupDiGetDeviceRegistryProperty(hDevInfo, &devInfo,
+                SPDRP_DEVICEDESC, NULL, buf, buf_len, &len);
+            if (res) {
+                assert(buf != NULL);
+                strncpy(port.name, buf, sizeof(port.name));
+                break;
+            } else {
+                assert(GetLastError() == ERROR_INSUFFICIENT_BUFFER);
+                if (buf != NULL) {
+                    sfree(buf);
+                }
+                buf = (char *) malloc(len);
+                buf_len = len;
+            }
+        }
+        int number;
+        if (sscanf(port.devname, "COM%d%1s", &number, buf) == 1) {
+            struct serialport_list *next = (struct serialport_list *)
+                malloc(sizeof(struct serialport_list));
+            assert(next != NULL);
+            memcpy(&next->value, &port, sizeof(struct serialport));
+            next->number = number;
+            next->next = head;
+            head = next;
+        }
+    }
+    if (buf != NULL) {
+        sfree(buf);
+    }
+    res = SetupDiDestroyDeviceInfoList(hDevInfo);
+    assert(res);
+
+    /*
+     * Sort the serial port list.
+     */
+    while (true) {
+        bool changed = false;
+        if (head) {
+            for (struct serialport_list **it = &head;
+                (*it)->next; it = &(*it)->next) {
+                if ((*it)->number < (*it)->next->number) {
+                    changed = true;
+                    struct serialport_list *tmp = *it;
+                    *it = tmp->next;
+                    tmp->next = (*it)->next;
+                    (*it)->next = tmp;
+                }
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+
+    /*
+     * Update the port display names.
+     */
+    for (struct serialport_list *it = head; it; it = it->next) {
+        int suffix_len = 2 + strlen(it->value.devname) + 1;
+        int name_len = strlen(it->value.name);
+        char name[sizeof(it->value.name)];
+        if (name_len + suffix_len >= sizeof(it->value.name)) {
+            it->value.name[
+                sizeof(it->value.name) - suffix_len - 4] = '\0';
+            snprintf(name, sizeof(name), "%s...", it->value.name);
+        } else {
+            strcpy(name, it->value.name);
+        }
+        snprintf(it->value.name, sizeof(it->value.name), "%s (%s)",
+            name, it->value.devname);
+    }
+
+    /*
+     * Convert the linked list to an array.
+     */
+    struct serialport_list *it;
+    struct serialport *sp;
+    size_t n;
+    for (n = 1, it = head; it; ++n, it = it->next);
+    sp = (struct serialport *)
+        ctrl_alloc(b, sizeof(struct serialport) * n);
+    memset(sp, 0, sizeof(struct serialport) * n);
+    for (n = 0; head; ++n) {
+        memcpy(&sp[n], &head->value, sizeof(struct serialport));
+        it = head->next;
+        free(head);
+        head = it;
+    }
+    return sp;
+}
+
 void setup_config_box(struct controlbox *b, bool midsession,
                       int protocol, int protcfginfo)
 {
@@ -1824,14 +2016,16 @@ void setup_config_box(struct controlbox *b, bool midsession,
         struct hostport *hp = (struct hostport *)
             ctrl_alloc(b, sizeof(struct hostport));
         memset(hp, 0, sizeof(*hp));
+        struct serialport *sp = list_serial_ports(b);
 
         s = ctrl_getset(b, "Session", "hostport",
                         "Specify the destination you want to connect to");
         ctrl_columns(s, 2, 75, 25);
         c = ctrl_editbox(s, HOST_BOX_TITLE, 'n', 100,
                          HELPCTX(session_hostname),
-                         config_host_handler, I(0), I(0));
+                         config_host_handler, P(sp), I(0));
         c->column = 0;
+        c->editbox.has_list = true;
         hp->host = c;
         c = ctrl_editbox(s, PORT_BOX_TITLE, 'p', 100,
                          HELPCTX(session_hostname),

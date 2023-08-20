@@ -1,5 +1,13 @@
-This is the README for PuTTY, a free Windows and Unix Telnet and SSH
-client.
+This is the README for a fork of PuTTY which allows selecting serial
+ports from a dropdown menu on Windows.
+
+The only difference between this and regular PuTTY is that this version
+does not require one to open Device Manager and find the name of a
+serial port to type into the configuration window; instead, it populates
+all available ports in a dropdown menu.  This essentially just fixes the
+following feature request, but does so in a way that may not work on all
+systems and with all serial devices:
+<https://www.chiark.greenend.org.uk/~sgtatham/putty/wishlist/win-enum-serial-ports.html>.
 
 PuTTY is built using CMake <https://cmake.org/>. To compile in the
 simplest way (on any of Linux, Windows or Mac), run these commands in
